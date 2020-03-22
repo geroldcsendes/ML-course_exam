@@ -1,0 +1,507 @@
+---
+title: "ML1 Assignment"
+author: "Gerold Csendes"
+date: '2020 02 21 '
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libs, message=FALSE, echo=FALSE}
+library(data.table)
+library(tidyverse)
+library(datasets)
+library(MASS)
+library(ISLR)
+library(caret)
+library(magrittr)
+library(skimr)
+library(GGally)   # ggplot extensions
+library(kableExtra)
+theme_set(theme_minimal())
+
+library(ISLR)
+library(NbClust)
+library(factoextra)
+```
+
+
+## 1. Supervised learning with penalized models and PCA (27 points)
+
+```{r data_load1}
+# more info about the data here: https://www1.nyc.gov/site/planning/data-maps/open-data/dwn-pluto-mappluto.page
+data <- readRDS(url('http://www.jaredlander.com/data/manhattan_Train.rds')) %>% 
+  as.data.table()
+data[, logTotalValue := log(TotalValue)]
+data[, TotalValue := NULL]
+data <- data[complete.cases(data)]
+```
+
+> a. Do a short exploration of data and find possible predictors of the target variable.
+
+```{r}
+skim(data)
+```
+
+```{r}
+ggcorr(data, label_size = 1)
+```
+
+
+```{r 1_a}
+
+# plot dependent var
+ggplot(data, aes(logTotalValue)) + 
+  geom_histogram(colour="darkblue", fill="lightblue") +
+  geom_vline(aes(xintercept=mean(logTotalValue, na.rm=T)),
+    color="purple", linetype="dashed", size=1) + 
+    theme(plot.title = element_text(hjust = 0.5))
+
+# boxplots for character vars
+ggplot(data, aes(ZoneDist2, logTotalValue)) + geom_boxplot()
+    
+```
+
+```{r}
+ggplot(data, aes(Proximity, logTotalValue)) + geom_boxplot()
+```
+
+Okay, so now after this very basic **EDA**, let's do some feature engineering based on the limited information that I have. I used some rule of thumbs to fit into the scope of this homework: 
+
+- I remove the ZoneDist variables except for the __ZoneDist2__ because these contained missing varialbes (coded as 'MISSING') 
+- I am going to apply a quadratic form of all variables that contain the __Area__ keyword 
+- All other numerical columns will be interacted with the most important seeming variables that have a low number of unique values 
+- Feature scaling will be applied to all numeric variables
+
+```{r}
+# Remove unnecessary columns: Mainly missing variables
+data[, c('ZoneDist1', 'ZoneDist3', 'ZoneDist4', 'ID') := NULL]
+
+# Council: administrative district (based on data dictionary) -> to factor
+data[, Council:= as.factor(Council)]
+
+# Only 2 obs 
+data <- data[Class != 'Utility']
+data[, Class := factor(Class)]
+
+# get data types of columns
+col_dtypes <- sapply(data, class)
+numcols <- names(col_dtypes[col_dtypes %in% c('integer', 'numeric')])
+numcols <- setdiff(numcols, c('logTotalValue')) # remove y var
+areacols <- numcols[endsWith(numcols, 'Area')]
+
+# create polynomials
+polys2 <- paste0(areacols, '2')
+# create poly vars
+data[, (polys2) := lapply(.SD, function(x) x**2 ), .SDcols=areacols]
+
+# interactions
+char_ints <- c('HistoricDistrict', 'Landmark', 'IrregularLot')
+# get rid of some not to include too many vars
+num_ints <- c('PolicePrct', 'NumFloors', 'NumFloors')
+# create interactions 
+interaction_vec <- c()
+for (char_int in char_ints) {
+  for (num_int in num_ints) {
+    interaction_vec <- c(interaction_vec, paste0(char_int, ' * ', num_int))
+  }
+}
+length(interaction_vec)
+
+# create new numcols vec with the polys appended
+numcols <- c(numcols, polys2)
+char_cols <- setdiff(names(data), numcols)
+char_cols <- char_cols[!char_cols %in% c('LandUse', 'LotType', 'logTotalValue')]
+X1 <- c(char_cols, numcols, interaction_vec)
+length(X1)
+```
+
+> b. Create a training and a test set, assigning 30% of observations to the training set. 
+
+I deliberately used a 0.6/0.4 split, since I created many variables and I feared overfitting even when doing CV
+
+```{r b}
+set.seed(1)
+train_indices <- createDataPartition(y = data$logTotalValue,  p = 0.6, times = 1, list = FALSE)
+data_train <- data[train_indices, ]
+data_test <- data[-train_indices, ]
+
+fit_control <- trainControl(method = 'cv', number = 10, verboseIter = FALSE)
+```
+
+> c. Use a linear regression to predict logTotalValue and use 10-fold cross validation to assess the predictive power.
+
+Prior to modeling, I will apply feature scaling (but not to the y var).
+
+```{r scale}
+preProcValues  <- preProcess(data_train, method=c('center','scale'))
+trainTransformed <- predict(preProcValues, data_train)
+# Don't scale target vars
+trainTransformed$logTotalValue <- data_train$logTotalValue
+# IMPORTANT: transform test via train transformation values
+testTransformed <- predict(preProcValues, data_test)
+testTransformed$logTotalValue <- data_test$logTotalValue
+```
+
+#### Linear Regression model
+
+```{r lm, message=FALSE}
+linear_model <- train(
+  formula(paste0('logTotalValue ~ ', paste0(X1, collapse = ' + '))),
+  data = trainTransformed,
+  method = 'lm',
+  trControl = fit_control
+)
+```
+
+> d. Use penalized linear models for the same task. Make sure to try LASSO, Ridge and Elastic Net models. Does the best model improve on the simple linear model?
+
+#### LASSO
+
+```{r LASSO, message=FALSE}
+# set up grid 
+tenpowers <- 10^seq(-1, -5, by = -1)
+lasso_tune_grid <- expand.grid(
+  "alpha" = c(1),
+  "lambda" = c(tenpowers, tenpowers / 2) 
+)
+
+lasso_model <- train(
+  formula(paste0('logTotalValue ~ ', paste0(X1, collapse = ' + '))),
+  data = trainTransformed,
+  method = 'glmnet',
+  trControl = fit_control,
+  tuneGrid = lasso_tune_grid
+)
+```
+
+#### Ridge
+
+```{r ridge, message=FALSE}
+ridge_tune_grid <- expand.grid(
+  'alpha' = 0 ,
+  'lambda' = seq(0.05, 1, by = 0.025)
+)
+
+ridge_model <- train(
+  formula(paste0('logTotalValue ~', paste0(X1, collapse = ' + '))),
+  data = trainTransformed,
+  method = 'glmnet',
+  tuneGrid = ridge_tune_grid,
+  trControl = fit_control
+)
+```
+
+#### Elastic net
+
+```{r enet, message=FALSE}
+enet_tune_grid <- expand.grid(
+  "alpha" = seq(0, 1, by = 0.1),
+  "lambda" = union(lasso_tune_grid[["lambda"]], ridge_tune_grid[["lambda"]])
+)
+
+enet_model <- train(
+  formula(paste0('logTotalValue ~', paste0(X1, collapse = ' + '))),
+  data = trainTransformed,
+  method = 'glmnet',
+  tuneGrid = enet_tune_grid,
+  trControl = fit_control
+)
+```
+
+#### Does the best model improve on the simple linear model?
+
+Yes, if you consider the mean cross-validated RMSEs, then all penalized models perform better.
+
+```{r resamps, echo=FALSE, message=FALSE}
+resamps <- resamples(list(LM = linear_model,
+                          Lasso = lasso_model,
+                          Ridge = ridge_model,
+                          ElasticNet = enet_model))
+resamps_summary <- summary(resamps)
+resamps_summary <- as.data.frame(resamps_summary$statistics$RMSE)
+resamps_summary$`NA's` <- NULL
+```
+
+```{r model_comp}
+kable(resamps_summary, caption = "Model performances", digits = 2) %>% 
+    kable_styling(latex_options = "hold_position")
+```
+
+> e. Which of the models you’ve trained is the “simplest one that is still good enough”? (Hint: explore adding selectionFunction = "oneSE" to the trainControl in caret’s train. What is its effect?).
+
+```{r e, echo=FALSE, message=FALSE}
+set.seed(1)
+fit_control_simple <- trainControl(method = 'cv', number = 10, selectionFunction = 'oneSE')
+
+lasso_model_simple <- train(
+  formula(paste0('logTotalValue ~ ', paste0(X1, collapse = ' + '))),
+  data = trainTransformed,
+  method = 'glmnet',
+  trControl = fit_control_simple,
+  tuneGrid = lasso_tune_grid,
+  
+)
+# create best tune df
+lasso_simple <- lasso_model_simple$bestTune
+lasso_simple$model <- 'LASSO simple'
+rownames(lasso_simple) <- NULL
+
+ridge_model_simple <- train(
+  formula(paste0('logTotalValue ~', paste0(X1, collapse = ' + '))),
+  data = trainTransformed,
+  method = 'glmnet',
+  tuneGrid = ridge_tune_grid,
+  trControl = fit_control_simple
+)
+
+# create best tune df
+ridge_simple <- ridge_model_simple$bestTune
+ridge_simple$model <- 'RIDGE simple'
+rownames(ridge_simple) <- NULL
+
+
+enet_model_simple <- train(
+  formula(paste0('logTotalValue ~', paste0(X1, collapse = ' + '))),
+  data = trainTransformed,
+  method = 'glmnet',
+  tuneGrid = enet_tune_grid,
+  trControl = fit_control_simple
+)
+
+# create best tune df
+enet_simple <- enet_model_simple$bestTune
+enet_simple$model <- 'ENET simple'
+rownames(enet_simple) <- NULL
+
+# create best tune for previous models
+# LASSO
+lasso_nonsimple <- lasso_model$bestTune
+lasso_nonsimple$model <- 'LASSO'
+rownames(lasso_nonsimple) <- NULL
+# Ridge
+ridge_nonsimple <- ridge_model$bestTune
+ridge_nonsimple$model <- 'RIDGE'
+rownames(ridge_nonsimple) <- NULL
+# Enet
+enet_nonsimple <- enet_model$bestTune
+enet_nonsimple$model <- 'ENET'
+rownames(enet_nonsimple) <- NULL
+```
+
+We can see that the __good enough__ parameters are all on the boundaries of the grids, so it may be worth to experiment with widening the `tuneGrids`.
+
+```{r e_output}
+kable(rbind(lasso_nonsimple, lasso_simple,
+      ridge_nonsimple, ridge_simple,
+      enet_nonsimple, enet_simple)) %>% 
+      kable_styling(latex_options = "hold_position")
+
+```
+
+> f. Now try to improve the linear model by using PCA for dimensionality reduction. Center and scale your variables and use pcr to conduct a search for the optimal number of principal components. Does PCA improve the fit over the simple linear model? (Hint: there are many factor variables. Make sure to include large number of principal components such as 60 - 90 to your search as well.)
+
+```{r f}
+tune_grid <- data.frame(ncomp = 1:90)
+set.seed(1)
+pcr_fit <- train(
+                formula(paste0('logTotalValue ~', paste0(X1, collapse = ' + '))),                
+                data = data_train, 
+                method = "pcr", 
+                trControl = fit_control,
+                tuneGrid = tune_grid,
+                preProcess = c("center", "scale")
+                )
+#pcr_fit
+#pcr_fit$coefnames
+```
+
+> g. If you apply PCA prior to estimating penalized models via preProcess, does it help to achieve a better fit? (Hint: also include "nzv" to preProcess to drop zero variance features). What is your intuition why this can be the case?
+
+```{r g}
+preProcValues <- preProcess(data_train, method=c('pca', 'nzv'), thresh = 0.95)
+trainTransformed <- predict(preProcValues, data_train)
+trainTransformed$logTotalValue <- data_train$logTotalValue
+
+# Train LASSO w. pca
+set.seed(1)
+lasso_pca_model <- train(
+  logTotalValue ~ .,
+  data = trainTransformed,
+  method = 'glmnet',
+  trControl = fit_control,
+  tuneGrid = lasso_tune_grid
+)
+
+# Train Ridge w. pca
+ridge_pca_model <- train(
+  logTotalValue ~ .,
+  data = trainTransformed,
+  method = 'glmnet',
+  tuneGrid = ridge_tune_grid,
+  trControl = fit_control
+)
+
+# Train Enet w. pca
+enet_pca_model <- train(
+  logTotalValue ~ .,
+  data = trainTransformed,
+  method = 'glmnet',
+  tuneGrid = enet_tune_grid,
+  trControl = fit_control
+)
+```
+
+```{r}
+resamps <- resamples(list(LM = linear_model,
+                          Lasso = lasso_model,
+                          Lasso_pca = lasso_pca_model,
+                          Ridge = ridge_model,
+                          Ridge_pca = ridge_pca_model,
+                          ElasticNet = enet_model,
+                          ElasticNet_pca = enet_pca_model))
+resamps_summary <- summary(resamps)
+resamps_summary <- as.data.frame(resamps_summary$statistics$RMSE)
+resamps_summary$`NA's` <- NULL
+
+kable(resamps_summary, caption = "Model performances", digits = 2) %>% 
+    kable_styling(latex_options = "hold_position")
+
+```
+
+This looks really weird because I was actually expecting the PCA versioned penalized models to be worse performing, since they reduce the variance in the data. Though this also reduces the noise, I initially thought that it wouldn't compensate the loss in variance. After careful inspection of the results, I found that I really made my job a lot more difficult that it was originally suggested by the task. For the penalized models, I created interactions and as some interactions were kind of rare in the dataset, in particular there was none in the train but there was occurence in the validation set in kfolds, caret suggested that my predictions in such cases were not trustworthy. Thus, to fit within the scope of this assignment, I chose the rather easier way of dropping some variables for the penalized models. This wasn't the case for PCA, because no interactions were applied thus more __base__ vars remained in my dataset. 
+
+After all, this is not a lab-like comparison of pca and other methods but I think this is a nice learning example that PCA can prove to be better performing in some **real-life** cases. 
+
+> h. Select the best model of those you’ve trained. Evaluate your preferred model on the test set.
+
+```{r h}
+testTransformed <- predict(preProcValues, data_test)
+testTransformed$logTotalValue <- data_test$logTotalValue
+
+RMSE(predict(lasso_pca_model, newdata = testTransformed), data_test[["logTotalValue"]])
+```
+
+## 2. Clustering on the USArrests dataset (18 points)
+
+> a. Think about any data pre-processing stesps you may/should want to do before applying clustering methods. Are there any?
+
+Steps:
+
+- remove categorical variables (there are none in this case) 
+- normalize the remaining numerical variables
+
+```{r 2a}
+data <- USArrests
+preProcValues <- preProcess(data, method = c('center', 'scale'))
+data_scaled <- predict(preProcValues, data)
+```
+
+
+> b. Determine the optimal number of clusters as indicated by NbClust heuristics.
+
+The majority rule suggests clusters of 2.
+
+```{r 2b}
+nb <- NbClust(data_scaled, method = "kmeans", 
+              min.nc = 2, max.nc = 10, index = "all")
+```
+
+
+> c. Use the k-means method to cluster states using the number of clusters found in a) and anything else that you think that makes sense. Plot observations colored by clusters in the space of urban population and another (crime-related) variable. (See example code from class, use factor(km$cluster) to create a vector of class labels).
+
+```{r 2c}
+km <- kmeans(data_scaled, centers = 2)
+data_scaled <- cbind(data_scaled,
+                      data.table('cl2' = factor(km$cluster)))
+
+ggplot(data_scaled, aes(UrbanPop, Assault, color = cl2)) +
+  geom_point() + 
+  labs(x = 'Urban pop', y = 'Assault scaled')
+
+```
+
+
+> d. Perform PCA and get the first two principal component coordinates for all observations by first 2 PCA components.
+
+The cluster division is easier to see in this PCA plot while in the last plot there is some overlap.
+
+```{r 2d}
+data_scaled_pca <- data_scaled %>% dplyr::select(-cl2)
+pca_result <- prcomp(
+  data_scaled_pca
+  )
+first_two_pc <- data.table(pca_result$x[, 1:2])
+# assign PCA comps to df
+data_scaled <- cbind(
+  data_scaled,
+  first_two_pc
+)
+
+ggplot(data_scaled, aes(PC1, PC2, color = cl2)) +
+  geom_point() 
+```
+
+## 3. PCA of high-dimensional data (optional, for extra 5 ponits)
+
+> a. Perform PCA on this data with scaling features.
+
+```{r 3a}
+data <- fread("../data/gene_data_from_ISLR_ch_10/gene_data.csv")
+data[, is_diseased := factor(is_diseased)]
+dim(data)
+
+data_features <- copy(data)
+data_features[, is_diseased := NULL]
+
+pca_result <- prcomp(data_features, scale. = TRUE)
+```
+
+> b. Visualize datapoints in the space of the first two principal components (look at the fviz_pca_ind function). What do you see in the figure?
+
+There is a clear distinction between the observations based on this plot. My gut-feeling is that this distinction is based on the health status of the individuals.
+
+```{r 3b}
+fviz_pca(pca_result, geom.var = c(""))
+```
+
+
+> c. Which individual features can matter the most in separating diseased from healthy? A strategy to answer this can be the following:
+
+We see that PC1 matters a lot:
+
+```{r 3c}
+variances <- pca_result$sdev^2
+variances_df <- data.frame(vf_explained = variances)
+variances_df$component <- seq(1:length(variances))
+ggplot(variances_df, aes(component, vf_explained)) + geom_line()
+```
+
+So look at which features have high loadings for the first PC, that is, the largest coordinates (in absolute terms). (Hint: use the $rotation). Choose the two features with the largest coordinates and plot observations in the coordinate system defined by these two original features. What do you see?
+
+```{r 3c2}
+pca_loadings <- as.data.frame(pca_result$rotation)
+pca_loadings$measure <- rownames(pca_loadings)
+
+pca_loadings <- pca_loadings %>%  
+  dplyr::select(PC1, measure)%>% 
+  arrange(desc(PC1))
+
+# sclae variables
+preProcValues <- preProcess(data_features, method = c('center', 'scale'))
+data_scaled <- predict(preProcValues, data_features)
+# assign target
+data_scaled$is_diseased <- data$is_diseased
+# plot colored by target
+ggplot(data_scaled, aes(measure_502, measure_589, color=is_diseased)) + geom_point()
+
+```
+
+
+
+
+
+
+

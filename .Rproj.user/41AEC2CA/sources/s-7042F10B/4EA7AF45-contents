@@ -1,0 +1,176 @@
+---
+title: "DA Assignment 3"
+author: "Gerold Csendes"
+date: '2020 02 16 '
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(caret)
+library(kableExtra)
+```
+
+I choose **Option 3** for this assignment.
+
+A side note regarding my work: I often faced both during my projects at work and at university that having a clear **structure** for a data science job is of crucial importance. Thus, I decided to use an R package called `ProjectTemplate` which provides a nice structure to such a project: http://projecttemplate.net/
+
+#### **Feedback** would be highly appreciated on this one: 
+What do you think of this project structure? I found it robost comparing to my previous use cases, I was only missing a `models` folder where I could save my RDS models so I don't have to run the time consuming models multiple times.
+
+### Data munging
+
+Aside from applying the filters as provided in the exercise, I didn't do much data munging. In particular, I didn't apply any other filters e.g. filtering highly priced hotels, since it couldn't do this for my test data. I did however defined _polynomials_ and _ordered factors_ for my variables. Then saved my _clean_ data as RDS, so these variable definitions are saved too.
+
+Should you want to reproduce this step, run `01-A.R` in `munge`.
+
+```{r eval=FALSE}
+hotels[, stars := factor(stars, order = T,
+                         levels = sort(unique(hotels$stars)))]
+hotels[, ratingta := factor(ratingta, order = T,
+                         levels = sort(unique(hotels$ratingta)))]
+hotels[, offer_cat:= factor(offer_cat, order = T,
+                levels = c("0% no offer", "1-15% offer",
+                           "15-50% offer", "50%-75% offer" ,"75%+ offer "))]
+hotels[, scarce_room:= factor(scarce_room)]
+hotels[, hotel_id := as.character(hotel_id)]
+
+# create polynomials
+polys <- c('distance', 'distance_alter', 'rating', 'rating_reviewcount',
+           'ratingta_count')
+polys2 <- paste0(polys, '2')
+
+# create poly vars
+hotels[, (polys2) := lapply(.SD, function(x) x**2 ), .SDcols=polys]
+
+# create ln var
+hotels[, lnprice := log(price)]
+
+saveRDS(hotels, paste0(clean_lib, "hotels.rds"))
+```
+
+## Modeling
+
+I am going to use 4 different models:  
+
+1. Random Forest (w. 12  _base_ vars)  
+2. Decisions Tree (w. 12  _base_ vars)  
+3. LASSO (w. 87 vars, _base_ vars extended w. polynomials and interactions)  
+4. GBM (w. 12  _base_ vars)  
+
+Prior to getting down to models, I wanted to run a model for both level and log dependent variables. Since `caret` had difficulties when using `PreProcess` within `train` like in the below example, I decided to standard scale my variables outside `train`. The issue was caused by variables with zero variances which were in fact dummy variables. Given that Max pointed out that when this happens, models are **not stable**, I preprocessed my data after splitting it and thus ensuring that only the numeric variables will be scaled. 
+
+To ensure that my models will be comparable in performance, I used standard scale variables for my tree based methods too. 
+
+#### **Feedback** would be highly appreciated on this one: 
+Can this considered to be a good practice? Or would it have been better to transform back the LASSO predicted values to LEVEL scale and then compare the performances?
+
+The problematic `preProcess` within `train`
+
+```{r eval = FALSE}
+set.seed(1)
+lasso_fit <- train(
+  mymodel,
+  data = data_train,
+  method = "glmnet",
+  preProcess = c("center", "scale"),
+  tuneGrid = lasso_tune_grid,
+  trControl = fit_control
+)
+```
+
+Preprocessing outside `train`. Since factors and characters are defined in data_train, only numeric vars will be transformed.
+
+```{r eval = FALSE}
+preProcValues  <- preProcess(data_train, method=c('center','scale'))
+trainTransformed <- predict(preProcValues, data_train)
+# IMPORTANT: transform test via train transformation attributes (mean and sd.dev)
+testTransformed <- predict(preProcValues, data_train)
+```
+
+When running the below `rpart2` tree model, I encountered the following warning message: 
+
+> Warning message: In nominalTrainWorkflow(x = x, y = y, wts = weights, info = trainInfo,  : There were missing values in resampled performance measures.
+
+I am quite confused because `rpart2` should be able to handle missing values and I specifically passed _na.pass_ so it should keep missing values. What could be behind this? 
+
+```{r eval = FALSE}
+cart_level <- train(
+  formula(paste0("price ~", paste0(rf1, collapse = " + "))),
+  data = trainTransformed, 
+  method = "rpart2",
+  trControl = train_control,
+  tuneGrid= tune_grid,
+  na.action = na.pass,
+  metric = 'RMSE')
+```
+
+GBM model:
+
+```{r eval = FALSE}
+# insight taken from here: https://topepo.github.io/caret/model-training-and-tuning.html#an-example
+gbmGrid <-  expand.grid(interaction.depth = c(1, 5, 9), 
+                        n.trees = (1:30)*50, 
+                        shrinkage = 0.1,
+                        n.minobsinnode = 20)
+
+nrow(gbmGrid) # 90 tuning param combinations
+set.seed(1)
+gbm_level <- train(
+    formula(paste0("price ~", paste0(rf1, collapse = " + "))),
+    data = trainTransformed,
+    method = "gbm", 
+    trControl = train_control, 
+    verbose = FALSE, 
+    tuneGrid = gbmGrid,
+    na.action = na.pass,
+)
+
+saveRDS(gbm_level, 'models/gbm_level.rds')
+```
+
+
+### Model comparison
+
+As you can see, the random forest performs the best followed by LASSO and GBM. Rpart2 is far behind. 
+
+```{r}
+eval <- read.csv('eval.csv')
+kable(eval, escape = F, caption = "Model performances", digits = 2) %>%
+  kable_styling(latex_options = "hold_position")
+
+```
+
+### Model performance on holdout set
+
+Following the _no looking back_ mindset regarding cross validation, I evaluated only the best performing model on the test set. Before doing that, I retrained the `Random Forest` with the optimal tuning parameters and calculated the RMSE.
+
+```{r eval=FALSE}
+rf_mtry <-  rf_model_level$finalModel$mtry
+rf_node_size <-  rf_model_level$finalModel$min.node.size
+rf_spit_rule <- rf_model_level$finalModel$splitrule
+
+rf_tune_grid <- data.frame(.mtry = rf_mtry,
+                           .splitrule = rf_spit_rule,
+                           .min.node.size = rf_node_size)
+set.seed(1)
+system.time({
+  holdout_model <- train(
+    formula(paste0("price ~", paste0(rf1, collapse = " + "))),
+    data = trainTransformed,
+    method = "ranger",
+    tuneGrid = rf_tune_grid,
+    importance = "impurity",
+    na.action=na.exclude,
+    metric = 'RMSE'
+  )
+})
+```
+
+And the RMSE on the test set is: **0.59**. 
+
+
+
+
+
+

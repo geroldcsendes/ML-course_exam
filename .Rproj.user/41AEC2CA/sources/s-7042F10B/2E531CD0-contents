@@ -1,0 +1,246 @@
+library(caret)
+library(data.table)
+library(skimr)
+library(stargazer)
+
+data_lib <- 'data/clean/'
+processed_lib <- 'data/processed/'
+fig_lib <- 'graphs/'
+
+# read in data
+data <- readRDS(paste0(data_lib, 'hotels.rds'))
+
+#################################
+######### Subset data ###########
+#################################
+set.seed(1)
+train_indices <- createDataPartition(data$price, p = 0.8, list = FALSE)
+data_train <- data[train_indices, ]
+data_holdout <- data[-train_indices, ]
+
+#################################
+######### Preprocess data #######
+#################################
+
+# This is needed for the lasso and I do the same for the tree based methods for
+# comparibility reasons
+preProcValues  <- preProcess(data_train, method=c('center','scale'))
+trainTransformed <- predict(preProcValues, data_train)
+# IMPORTANT: transform test via train transformation values
+testTransformed <- predict(preProcValues, data_train)
+
+#####################################
+######## Variable sets ##############
+#####################################
+rf1 <- setdiff(colnames(data_train),
+              c('hotel_id', 'city_actual', 'neighbourhood', 'lnprice', 'price',
+                'holdout', 'offer'))
+rf1 <- rf1[!endsWith(rf1, '2')]
+# LASSO
+X_lasso <- setdiff(colnames(data_train),
+                c('hotel_id', 'city_actual', 'neighbourhood', 'lnprice', 'price',
+                  'offer', 'ln_price' ))
+
+int_num <- c('distance', 'distance_alter', 'rating_reviewcount', 
+             'ratingta', 'ratingta_count')
+polys <- colnames(data_train)
+polys <- polys[endsWith(polys, '2')]
+int_num <- c(int_num, polys)
+
+int_cat <- c('accommodation_type', 'offer_cat', 'scarce_room', 'country', 
+             'city')
+
+interactions_lasso <- c()
+for (int in int_num) {
+  for (cat in int_cat) {
+  interactions_lasso <- c(interactions_lasso, paste0(int , ' * ', cat))
+  }
+}
+
+cat_interactions <- c()
+for (cat1 in int_cat) {
+  for (cat2 in int_cat) {
+    if (cat1 != cat2) {
+      cat_interactions <- c(cat_interactions, paste0(cat1, ' * ', cat2))
+    }
+  }
+}
+
+interactions_lasso <- c(interactions_lasso, cat_interactions)
+X_lasso <- c(X_lasso, interactions_lasso)
+length(X_lasso)
+
+####################################
+######### Random Forest ############
+####################################
+# do 5-fold CV
+set.seed(1)
+train_control <- trainControl(method = "cv",
+                              number = 5,
+                              savePredictions = "all")
+                              #verboseIter = FALSE)
+
+# set tuning
+tune_grid <- expand.grid(
+  .mtry = seq(1,5),
+  .splitrule = "variance",
+  .min.node.size = seq(4:9)
+)
+
+# rf model level
+set.seed(1)
+system.time({
+  rf_model_level <- train(
+    formula(paste0("price ~", paste0(rf1, collapse = " + "))),
+    data = trainTransformed,
+    method = "ranger",
+    trControl = train_control,
+    tuneGrid = tune_grid,
+    importance = "impurity",
+    na.action=na.exclude,
+    metric = 'RMSE'
+  )
+})
+
+rf_model_level
+saveRDS(rf_model_level, 'models/rm_model_level.rds')
+
+####################################
+######### CART #####################
+####################################
+
+# check upon tree models
+modelLookup("rpart2")
+modelLookup("rpart")
+
+# set tuning
+tune_grid <- expand.grid(
+  maxdepth = seq(3:10)
+)
+
+# level model
+set.seed(1)
+cart_level <- train(
+  formula(paste0("price ~", paste0(rf1, collapse = " + "))),
+  data = trainTransformed, 
+  method = "rpart2",
+  trControl = train_control,
+  tuneGrid= tune_grid,
+  na.action = na.pass,
+  metric = 'RMSE')
+
+cart_level$results
+cart_level
+saveRDS(cart_level, 'models/cart_level.rds')
+
+
+####################################
+######### LASSO ####################
+####################################
+
+# preprocessing is necessary here
+
+lambdas <- c(1, 0.8, 0.7, 0.5) 
+lambdas <- c(lambdas, (10^seq(-1, -5, by = -1)))
+lasso_tune_grid <- expand.grid(
+  "alpha" = c(1),
+  "lambda" = c(lambdas, lambdas / 2) 
+)
+
+# LEVEL model
+set.seed(1)
+lasso_level <- train(
+  formula(paste0("price ~", paste0(X_lasso, collapse = " + "))),  
+  data = trainTransformed,
+  method = "glmnet",
+  tuneGrid = lasso_tune_grid,
+  trControl = train_control,
+  na.action = na.exclude
+)
+
+lasso_level
+saveRDS(lasso_level, 'models/lasso_level.rds')
+
+####################################
+######### GBM ######################
+####################################
+
+# insight taken from here: https://topepo.github.io/caret/model-training-and-tuning.html#an-example
+gbmGrid <-  expand.grid(interaction.depth = c(1, 5, 9), 
+                        n.trees = (1:30)*50, 
+                        shrinkage = 0.1,
+                        n.minobsinnode = 20)
+
+nrow(gbmGrid)
+set.seed(1)
+gbm_level <- train(
+    formula(paste0("price ~", paste0(rf1, collapse = " + "))),
+    data = trainTransformed,
+    method = "gbm", 
+    trControl = train_control, 
+    verbose = FALSE, 
+    ## Now specify the exact models 
+    ## to evaluate:
+    tuneGrid = gbmGrid,
+    na.action = na.pass,
+)
+
+gbm_level
+saveRDS(gbm_level, 'models/gbm_level.rds')
+
+####################################
+######### Model comp ###############
+####################################
+
+resamps <- resamples(list(LASSO = lasso_level,
+                          Rpart2 = cart_level,
+                          RandomForest = rf_model_level,
+                          GBM = gbm_level))
+
+resamps$metrics
+resamps_summary <- summary(resamps)
+eval <- as.data.frame(resamps_summary$statistics$RMSE)
+eval$`NA's` <- NULL
+eval$Model <- rownames(eval)
+eval <- eval[,c(7, seq(1:6))]
+
+write.csv(eval, 'reports/eval.csv', row.names = F)
+
+####################################
+######### Holdout perf. ############
+####################################
+
+# train winner model on the whole train set
+rf_mtry <-  rf_model_level$finalModel$mtry
+rf_node_size <-  rf_model_level$finalModel$min.node.size
+rf_spit_rule <- rf_model_level$finalModel$splitrule
+
+rf_tune_grid <- data.frame(.mtry = rf_mtry,
+                           .splitrule = rf_spit_rule,
+                           .min.node.size = rf_node_size)
+
+set.seed(1)
+system.time({
+  holdout_model <- train(
+    formula(paste0("price ~", paste0(rf1, collapse = " + "))),
+    data = trainTransformed,
+    method = "ranger",
+    tuneGrid = rf_tune_grid,
+    importance = "impurity",
+    na.action=na.exclude,
+    metric = 'RMSE'
+  )
+})
+
+# save model
+saveRDS(holdout_model, 'models/final_rf.rds')
+
+testTransformed <- testTransformed[complete.cases(testTransformed)]
+holdout_prediction <- predict(holdout_model, 
+                              newdata = testTransformed)
+testTransformed$rf_preds <- holdout_prediction
+RMSE(testTransformed$price, testTransformed$rf_preds)
+
+## save data
+saveRDS(testTransformed, paste0(processed_lib, 'testTransformed.csv'))
+saveRDS(trainTransformed, paste0(processed_lib, 'trainTransformed.csv'))

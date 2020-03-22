@@ -1,0 +1,40 @@
+"0","library(data.table)"
+"2","Registered S3 method overwritten by 'data.table':
+  method           from
+  print.data.table     
+"
+"2","data.table 1.12.8 using 2 threads (see ?getDTthreads).  Latest news: r-datatable.com
+"
+"0","library(caret)"
+"2","Loading required package: lattice
+"
+"2","Loading required package: ggplot2
+"
+"2","Registered S3 method overwritten by 'dplyr':
+  method           from
+  print.rowwise_df     
+"
+"0","library(MLmetrics)"
+"2","package ‘MLmetrics’ was built under R version 3.6.3"
+"2","
+Attaching package: ‘MLmetrics’
+
+"
+"2","The following objects are masked from ‘package:caret’:
+
+    MAE, RMSE
+
+"
+"2","The following object is masked from ‘package:base’:
+
+    Recall
+
+"
+"0","library(kableExtra)"
+"2","Registered S3 methods overwritten by 'htmltools':
+  method               from         
+  print.html           tools:rstudio
+  print.shiny.tag      tools:rstudio
+  print.shiny.tag.list tools:rstudio
+"
+"0","library(skimr)"

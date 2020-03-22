@@ -1,0 +1,25 @@
+{
+    "collab_server" : "",
+    "contents" : "",
+    "created" : 1584823263572.000,
+    "dirty" : false,
+    "encoding" : "UTF-8",
+    "folds" : "",
+    "hash" : "0",
+    "id" : "2E531CD0",
+    "lastKnownWriteTime" : 1581868685,
+    "last_content_update" : 1581868685,
+    "path" : "C:/Users/gerol/Desktop/CEU/trim2/DA3/assignment/asgn3/src/model.R",
+    "project_path" : null,
+    "properties" : {
+        "cursorPosition" : "238,15",
+        "scrollLine" : "230"
+    },
+    "read_only" : false,
+    "read_only_alternatives" : [
+    ],
+    "relative_order" : 7,
+    "source_on_save" : false,
+    "source_window" : "",
+    "type" : "r_source"
+}
