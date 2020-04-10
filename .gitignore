@@ -37,3 +37,14 @@ vignettes/*.pdf
 
 # R Environment Variables
 .Renviron
+
+# any RDS files
+**/*.RDS
+**/*.rds
+
+# Rproj
+.Rproj.user
+
+# Docs, excel
+*.docx
+*.xlsx
