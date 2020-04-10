@@ -9,6 +9,17 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
+### Disclaimer
+
+Since I consider reproducibility and maintainabilty as highest priority in data science, I didn't work in a huge markdown script but rather went for a more sound infrastructure to organize my code. I have published my assignment to github where - if you decide to take a look at it - you will find these directories: 
+
+- data: this contains the raw, processed data and also the predictions of various model types 
+- report: the html report
+- src: scripts for data munging, helper functions and modeling 
+
+I am not going to paste in all the code that would be too tedious for the scope of this report. However, I will show the most important parts of my code so I can show that I demonstrated the various skills acquired during this course.
+
+
 ```{r libs, echo=FALSE, message=FALSE, warning=FALSE}
 library(data.table)
 library(caret)
@@ -18,11 +29,11 @@ library(skimr)
 library(Boruta) # for finding relevant vars for LM model
 ```
 
-##  Step 0
+## EDA
 
-In this step, data is read and a high-level of data exploration is implemented. Then, variables are coded to suitable data types for the sake of the analysis. 
+In this step, data is read and a high-level of data exploration is implemented. Then, variables are coded to suitable data types for the sake of the analysis (see more in __src/munge.R__). 
 
-To avoid overfitting, I will apply 8-fold cross validation. The metric on which I will evaluate is the **AUC**.
+There are quite a number of categorical variables that need to be coded from numeric to dummy data types. Skimming the data provide just enough insight into the data.
 
 ```{r data_read}
 # Read in data
@@ -49,26 +60,15 @@ data_train[, (factor_vars) := lapply(.SD, factor), .SDcols = factor_vars]
 # for binary prediction, the target variable must be a factor with levels
 levels(data_train$is_popular) <- c("No", "Yes")
 
-
 # convert test to factor as well
 # is_popular is not in test
 factor_vars_test <- setdiff(factor_vars, 'is_popular')
 data_test[, (factor_vars_test) := lapply(.SD, factor), .SDcols = factor_vars_test]
-# str(data_test)
-
-# Cross validaiton
-# set CV as train control
-train_control <- trainControl(
-  method = "cv",
-  number = 8,
-  classProbs = TRUE,
-  summaryFunction = multiClassSummary # needed for AUC metric
-)
 ```
 
 For the non-tree based methods, let's scale the data.
 
-```{r scale}
+```{r scale, eval = FALSE}
 # train data
 preProcValues  <- preProcess(data_train, method=c('center','scale'))
 trainTransformed <- predict(preProcValues, data_train)
@@ -81,11 +81,13 @@ testTransformed <- predict(preProcValues, data_test)
 
 ## Linear model prediction after parameter tuning
 
+I want to note at this point that I didn't separate out a holdout set within my train dataset. I considered the dataset on which the submissions were evaluated as my holdout. Thus, I could take advantage of more data that I could train my models on. Of course I used cross validation when training my models.
+
 Since I am requested to create a linear model, there isn't much place for feature engineering. To be more precise, polynomials my not enter this model. That leaves me with the only option of finding relevant interactions. I am going to use the `boruta` package to find the most important variables and I will use that to interact the relevant factor and numeric variables. By the way, `boruta` uses __recursive feature elimination__ by basically applying many **Random Forest** models and then evaluating the variables based on the variable importance plots.
 
-To end up with more robust models, I will use LASSO to shrink some coefficients exactly to zero. Thus, decreasing model complexity. 
+To end up with more robust models, I will use LASSO to shrink some coefficients exactly to zero. Thus, decreasing model complexity. (See more in __src/boruta.R__ and __linear.R__)
 
-```{r lm_prep}
+```{r lm_prep, eval = FALSE, warning=FALSE}
 # Only use a subset of data, otherwise runs forever..
 set.seed(1)
 boruta_data<- data_train[sample(nrow(data_train), 2000), ]
@@ -95,23 +97,22 @@ boruta_train <- Boruta(
             data = boruta_data,
             doTrace = 3
 )
+```
 
+```{r boruta_res}
 # Take a look at the result
-boruta_train
-boruta_decision <- boruta_train$finalDecision
-names(boruta_decision[boruta_decision == 'Tentative'])
-getSelectedAttributes(boruta_train, withTentative = F)
+boruta_res <- readRDS('../data/boruta/boruta.RDS')
+boruta_res
 
-boruta_df <- attStats(boruta_train)
-boruta_df[order(-boruta_df$medianImp),]
-boruta_df_factor <- boruta_df[factor_vars,]
-boruta_df_factor[order(-boruta_df_factor$medianImp),]
-
+# let's make this into a dataframe
+boruta_df <- attStats(boruta_res)
+boruta_df <- boruta_df[order(-boruta_df$medianImp),c("medianImp", "decision")]
+boruta_df
 ```
 
 After taking a look at the results,I will include 3 variables into the interaction terms: 1) __data_channel_is_world__, __data_channel_is_tech__, __data_channel_is_lifestyle__. The numeric interaction terms will be: __kw_avg_avg__, __kw_max_avg__, __kw_min_avg__.
 
-```{r lm}
+```{r lm, eval = FALSE}
 factor_ints <- c('data_channel_is_world', 'data_channel_is_tech', 'data_channel_is_lifestyle')
 num_ints <-  c('kw_avg_avg', 'kw_max_avg', 'kw_min_avg')
 lasso_interactions <- c()
@@ -141,19 +142,48 @@ lasso_model <- train(
     tuneGrid = lasso_tune_grid,
     metric = 'AUC'
 )
-
-lasso_model
 ```
 
-Since optimal lambda is within the refined range, I consider this model to be tuned (well). Let's predict and submit the results!
-
-```{r lm_pred}
-lasso_preds <- data_test[, 'article_id']
-lasso_preds$score  <- predict(lasso_model, newdata = testTransformed, type="prob")$Yes
-write.csv(lasso_preds, '../data/lm.csv', row.names = F)
-```
+Since optimal lambda is within the refined range, I consider this model to be tuned (well). 
 
 ## Random forest prediction after parameter tuning
+
+Before jumping into the random forest code, let's take a moment and compare it with the previous, linear regression model. 
+
+1. In general, __tree-based__ methods don't take advantage of feature scaling 
+2. It requires much more parameter tuning
+
+My strategy was the following: start out with a grid using ML rule-of-thumbs (like mtry=square root of variables included) and when the results fall close to the edge of the grid, then expand to that direction. By the way, an alternative approach may have been to use __Random Hyperparameter Search__ but it is actually quite discouraged in the caret documentation [link] (https://topepo.github.io/caret/random-hyperparameter-search.html) for the models we usually use in class. However, the ranger is not listed there.
+
+On top of this, I wanted to address a potential performance issue of tree based methods, namely a relative big number of irrelevant variables. The other extreme, when there are only features with high importance is also not admired, since that would result in correlated trees, which is really not the point here. I facilitated the results of boruta and excluded the day dummy variables. This decreased the number of unimportant features from 11 to 5 and the tentative from 9 to 8. To make sure trees will be decorrelated, the hyperparameter search space must be adjusted, for example by decreasing the mtry or other parameters that control model complexity. (more about this in __src/rf.R__)
+
+Since parameter tuning is kind of a sequential, try-and-error wokflow and parameter sets are run in "batch", I wrote helper functions that keep track of model perfromances across batches and also save the best models, so they don't have to be run later. Thus sparing time for the data scientist who can go back do what he usally does in work: writing sql queries and complain about data.
+
+The `top_performers()` selects the best models of a batch based on AUC and a criterion.
+
+```{r helper1, eval = FALSE}
+### Select top performants
+top_performers <- function(model, model_params, criterion) {
+  
+  # extract results
+  model_results <- model$results
+  model_results <- model_results[order(- model_results$AUC),]
+  model_results <- model_results[, model_params]
+  
+  # select results within 0.005% performance in AUC
+  top_AUC <- max(model_results$AUC)
+  AUC_min <- top_AUC - (top_AUC * criterion)
+  print(AUC_min)
+  
+  model_results <- model_results[model_results[["AUC"]] >= AUC_min, ]
+  
+  return(model_results)
+}
+```
+
+Another helper functions is called `estimate_top_rf_models()` that retrains the best-performing models on the whole dataset (of course I do cross validation) and then saves the model to a model dedicated folder named after its parameters like __models/rf/mtry2_splitrule1_min.node.size6.RDS__. (See more in __src/helpers__)
+
+This is to show you how I was extending the grid search.
 
 ```{r RF}
 rf_grid <- expand.grid(
@@ -162,43 +192,56 @@ rf_grid <- expand.grid(
   min.node.size = c(7, 8, 9, 10, 11)
 )
 
-set.seed(1)
-rf_model <- train(
-      is_popular ~.,
-      method = "ranger",
-      data=data_train,
-      trControl = train_control,
-      tuneGrid = rf_grid,
-      verbose = FALSE,
-      metric = "AUC",
-      importance = 'impurity'
+rf_grid1_ext <- expand.grid(
+  mtry = c(5),
+  splitrule = "gini",
+  min.node.size = c(5, 6, 12, 13)
+)
+
+rf_grid2 <- expand.grid(
+  mtry = c(3,4),
+  splitrule = "gini",
+  min.node.size = c(7, 8, 9, 10, 11)
 )
 ```
 
-## Gradient boosting prediction after parameter tuning
+As you can see, the mtry parameters for the restricted variable set (boruta) is smaller which facilitates more decorellated trees. In fact, the best performing boruta random forest had mtry=2 while mtry=5 for the full set.
 
-```{r GBM}
-# Train GBM
-gbm_grid <- expand.grid(n.trees = c(300, 500), 
-                        interaction.depth = c(2, 3, 5), 
-                        shrinkage = c(0.005, 0.01, 0.1),
-                        n.minobsinnode = c(5, 7, 9, 11))
-set.seed(1)
-gbm_model <- train(is_popular ~.,
-                   method = "gbm",
-                   data = data_train,
-                   trControl = train_control,
-                   tuneGrid = gbm_grid,
-                   verbose = FALSE, 
-                   metric = 'AUC'
-                   )
+```{r rf_boruta}
+boruta_rf_grid1 <- expand.grid(
+  mtry = c(3, 4, 5),
+  splitrule = "gini",
+  min.node.size = c(6, 7, 8)
+)
+
+boruta_rf_grid2 <- expand.grid(
+  mtry = c(2),
+  splitrule = "gini",
+  min.node.size = c(5, 6, 7, 8)
+)
 ```
 
-## Neural network prediction after parameter tuning
 
-```{r NN}
+## Extreme gradient boosting prediction after parameter tuning
 
+One of the reasons I didn't go for an H2O environment was that I wanted to experiment with XGBoost (and also with LightGBM) which is not available on Windows (the latter on neither OS as far as I know.) These methods were praised by Szilárd Pafka and made very curious. One big advantage of H2O - aside from its supportive env for production - is that stacking is very easy. Prior to using `caretEnsemble` R package, I thought it wouldn't be a big issue but what I later found out that if you want to combine really different models then `caretEnsemble` will be impossible to implement. The lesson I learned is that it is not enough just to check what models are available in `caret` but also check whether they can be tuned as in the "native" packages (see later example with NNs).
+
+Tuning XGBoost is kinda like RF only that the number of hyperparameters is a lot bigger. You can check this by:
+
+```{r}
+library(caret)
+modelLookup('xgbTree')
 ```
+
+And as the `caret` documentation stated, it is not worth using randomized search for this model type. By the way, caret "utilizes the “sub-model trick” where M tuning parameter combinations are evaluated, potentially far fewer than M model fits are required". That sounds really fancy and I hope I will get to understand this.  
+
+I don't think it is necessary at this point to again show my grid search evolution as I did with the random forest. I experimented a lot and I guess I came to a good enough solution. What may be worth however, is to show how I grouped the parameters so that I could reduce the number of parameter combinations to run.
+
+I treated eta, gamma and nrounds basically under one roof. These are mostly responsible for model convergence. Bigger nrounds could not really hurt but it is not worth running anotehr 300 trees if there is no improvement in performance. Thus I defined gamma as a constant at 0.0002, meaning that if the AUC doesn't improve by this amount then the model will be declared to be converged. Tuning eta can lead to quicker convergence but I decided to leave it as a constant too, at 0.01 but to tackle the potential issue of not raching convergence, I used relatively bigger nrounds.
+
+Max_depth and min_child_weght account for complexity and I considered them to be the most important parameters. Thus, I played around a lot with them, while also trying out several values for subsample and colsample_bytree which are responsible for randomization.
+
+## Extreme gradient boosting prediction after parameter tuning
 
 
 
